@@ -1,88 +1,118 @@
-const { Readable, Writable, Transform } = require('stream')
+const { Readable, Writable, Transform, pipeline } = require('stream')
+const fs = require('fs')
 const Diffy = require('diffy')
-const trim = require('diffy/trim')
 
-/*
- * Stream of random letters will go into a transform
- * The transform will emit words to a word processor
- * The processor will update a simple state that consists of
- * a word's frequency so far. The state will be graphed
- * visually in the terminal, along with the original stream
- * of letters.
- *
- * Since the letter stream is unending, they will be collected
- * into a sliding window to be displayed.
- *
- */
+function randomLetters () {
+  // const pool = 'abcdefghijklmnopqrstuvwxyz '.split('').map(x => x.charCodeAt(0))
+  //
+  // it's easier to see zipf with smaller alphabets
+  // and it's much easier to see zipf if you don't have to keep
+  // an unending list of gargantuan words in a map; so here we will
+  // make the alphabet small, and below we will make the words have
+  // a length limit
+  const pool = 'abc '.split('').map(x => x.charCodeAt(0))
 
-function randomLetters (freq) {
-  const pool = 'abcdefghijklmnopqrstuvwxyz '.split('')
-  const stream = new Readable({
-    encoding: 'utf-8',
-    read() {}
-  })
-
-  setInterval(() => {
-    stream.push(pool[Math.floor(Math.random() * pool.length)])
-  }, freq)
-
-  return stream
-}
-
-function lettersToWords () {
-  let word = ''
   return new Transform({
     encoding: 'utf-8',
-    decodeStrings: false,
-    transform (ltr, _, done) {
-      if (ltr === ' ') {
-        done(null, word)
-        word = ''
-      } else {
-        word += ltr
-        done()
-      }
+    transform (chunk, _, done) {
+      const ltrs = chunk.map(b => pool[b % pool.length])
+      done(null, ltrs)
     }
   })
 }
 
-function buildStats (wordOccurrences) {
-  const allOccurs = [...wordOccurrences.values()].reduce((sum, freq) => sum + freq, 0)
+function lettersToWords () {
+  const stream = new Transform({
+    encoding: 'utf-8'
+  })
+
+  stream._transform = function (chunk, _, done) {
+    let word = []
+    for (const ch of chunk) {
+      if (ch === 32 || word.length > 6) {
+        if (word.length) { this.push(word.join('')) }
+        word = []
+      } else {
+        word.push(String.fromCharCode(ch))
+      }
+    }
+    done()
+  }
+
+  return stream
+}
+
+function abbreviate (word) {
+  let shortWord = word.length < 10 ? word : `${word.slice(0, 10)}...`
+  while (shortWord.length < 13) shortWord += ' '
+  return shortWord
+}
+
+function refreshStats (wordOccurrences, allOccurs) {
+  const scale = Scale(0, 1, 0, process.stdout.columns)
   const entries = [...wordOccurrences.entries()]
-    .map(([word, count]) => ({ word, freq: count / allOccurs }))
+    .map(([word, count]) => ({
+      label: abbreviate(word),
+      value: scale(count / allOccurs),
+      percent: `${((count / allOccurs) * 100).toFixed(2)}%`
+    }))
 
-  entries.sort((a, b) => b.freq - a.freq)
+  const data = entries.slice(0, Math.floor(process.stdout.rows * 3/4))
+  data.sort((a, b) => b.value - a.value)
+  return data.map(({ label, value, percent }) => `${label} ${value < 1 ? '.' : '*'.repeat(value)} ${percent}`).join('\n')
+}
 
-  return entries.slice(0, Math.floor(process.stdout.rows * 3/4))
-    .map(({ word, freq }, idx) => {
-      let shortWord = word.length < 10 ? word : `${word.slice(0, 10)}...`
-      while (shortWord.length < 13) shortWord += ' '
-      let rank = `${idx + 1}. `
-      while (rank.length < 4) rank += ' '
-      return `${rank}${shortWord} => ${freq}`
-    })
-    .join('\n')
+function buildStats (wordOccurrences, allOccurs) {
+  let chart = refreshStats(wordOccurrences, allOccurs)
+
+  let calls = 0
+  return (updatedWordOccurrences, updatedAllOccurs) => {
+    return refreshStats(updatedWordOccurrences, updatedAllOccurs)
+
+    // if debouncing is needed
+    if (calls % 100 === 0) {
+      chart = refreshStats(updatedWordOccurrences, updatedAllOccurs)
+    }
+    calls++
+    return chart
+  }
 }
 
 function line () {
   return '-'.repeat(process.stdout.columns)
 }
 
+function Scale (rmin, rmax, tmin, tmax) {
+  return (m) => {
+    if (m < rmin || m > rmax) throw new Error('measurement is outside allowable range')
+    return (((m - rmin) / (rmax - rmin)) * (tmax - tmin)) + tmin
+  }
+}
+
 async function main () {
   const diffy = Diffy({ fullscreen: true })
 
-  const letters = randomLetters(0)
-  const words = letters.pipe(lettersToWords())
+  const letters = randomLetters()
+  const words = lettersToWords()
+  pipeline(
+    fs.createReadStream('/dev/random'),
+    letters,
+    words,
+    (err) => {
+      console.error(err)
+    }
+  )
 
   // buffer a couple letters to display a sliding window
-  const buffer = []
+  let buffer = []
   let lettersSoFar = 0
-  letters.on('data', (letter) => {
-    if (buffer.length >= process.stdout.columns - 1) {
-      buffer.shift()
-    }
-    buffer.push(letter)
-    lettersSoFar++
+  letters.on('data', (lettersChunk) => {
+    // letters are coming in so fast it's not really even
+    // feasible to display a sliding window... instead just
+    // make it look interesting by displaying a bit of
+    // the most recent chunk
+    buffer = lettersChunk.slice(0, process.stdout.columns)
+    lettersSoFar += lettersChunk.length
   })
 
   const wordOccurrences = new Map()
@@ -93,17 +123,18 @@ async function main () {
       (wordOccurrences.get(word) || 0) + 1
     )
     wordsSoFar++
-    diffy.render()
   })
 
-  diffy.render(() => trim(`
-    ${buffer.join('')}
-    ${line()}
-    ${buildStats(wordOccurrences)}
-    ${line()}
-    Letters: ${lettersSoFar} Words: ${wordsSoFar}
-  `))
+  const getStats = buildStats(wordOccurrences, wordsSoFar)
 
+  diffy.render(() => `
+${buffer}
+${line()}
+${getStats(wordOccurrences, wordsSoFar)}
+${line()}
+Letters: ${lettersSoFar} Words: ${wordsSoFar} Unique Words: ${wordOccurrences.size}`)
+
+  setInterval(() => diffy.render(), 100)
 }
 
 main()
